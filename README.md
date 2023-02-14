@@ -17,18 +17,9 @@ The protocol works as follows:
     
 - Any node willing to have information about Quorum, connect to the Rendezvous node and gets Quorum Peers with the Quorum Key namespace
     
-- The sender then encrypts the message using the recipient's public key and its own secret key.
-    
-- The encrypted message is then broadcast to the network, along with a hash of the message and the sender's public key.
-    
--  When a node receives a message, it first verifies the hash to ensure that the message has not been tampered with.
-    
--  If the hash is valid, the node looks up the sender's public key in the DHT to obtain its network address.
-    
--  The node then uses its own secret key to decrypt the message.
-    
--   If the decryption is successful, the node can read the message and take appropriate action.
-    
+- Rendezevous Node will ping for all quorum peers liveness
+
+ 
 
 Threshold cryptography is used to ensure the security of the network. In threshold cryptography, multiple parties must work together to generate a key, and no individual party can access the key on its own. This means that even if some nodes in the network are compromised, the network as a whole remains secure. Here Quorum DHT will be secured
 
