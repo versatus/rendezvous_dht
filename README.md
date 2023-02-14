@@ -67,5 +67,5 @@ RUST_FLAGS=-Awarnings cargo  run  --example  Demo  --  --port  8082  --bootstrap
 	2. For Manual Testing
 
 	```
-	  cargo  run  --example  test
+	  cargo  run  --example  Demo
 	```
