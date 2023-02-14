@@ -163,7 +163,7 @@ impl Node {
                         match ping_status_receiver.try_recv() {
                             Ok((peer, ping_status)) => {
                                 let failed_ping: u8 = if ping_status { 0 } else { 1 };
-                                println!("Unreachable peer: {:?}", peer);
+                                info!("Unreachable peer: {:?}", peer);
                                 let peer_address = Node::get_key(peer.to_string().as_bytes());
                                 match storage.unreachable_peers.get_mut(&peer_address) {
                                     None => {
@@ -192,7 +192,6 @@ impl Node {
                                         ));
                                     }
                                 }
-                                println!("Storage {:?}", storage.unreachable_peers);
                                 for value in list {
                                     if value.3 >= UNREACHABLE_THRESDHOLD {
                                         if let Some(peers) = storage.quorum_peers.get_mut(&value.0)

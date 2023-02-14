@@ -10,14 +10,13 @@ use std::{io::stdin, time::Duration};
 
 use crate::Data::Request;
 use crate::Data::Response;
-use crate::NodeType::{FARMER, HARVESTER};
 use bincode::{deserialize, serialize};
 use serde_derive::{Deserialize, Serialize};
 
 const SERVER: &str = "127.0.0.1:9090";
 
 fn client() -> Result<(), ErrorKind> {
-    let addr = "127.0.0.1:6061";
+    let addr = "127.0.0.1:6060";
     // let mut socket = Socket::bind(addr)?;
 
     let mut socket = Socket::bind_with_config(
@@ -70,10 +69,10 @@ fn client() -> Result<(), ErrorKind> {
             hex::decode("b7be0d2cbc712860e983ab1d80fe08fa122fd86111de8277a350c336065de658cc17a6d69511ee9a31c09aad3ac10f64123706abe84f00fc850872787dd7412851f83de0fea915548434f669613f92d3af44ca21547a8edcd2731c8ab39668d5").unwrap(),
             "HelloVrrb".to_string().as_bytes().to_vec(),
             PeerData {
-                address: "127.0.0.1:6061".to_string(),
+                address: "127.0.0.1:6060".to_string(),
                 raptor_udp_port: 8082,
                 quic_port: 8083,
-                node_type: NodeType::FARMER,
+                node_type: NodeType::Farmer,
             },
         )))
         .unwrap(),None
@@ -91,12 +90,12 @@ fn client() -> Result<(), ErrorKind> {
                 address: "127.0.0.1:6062".to_string(),
                 raptor_udp_port: 8082,
                 quic_port: 8083,
-                node_type: NodeType::FARMER,
+                node_type: NodeType::Farmer,
             },
         )))
             .unwrap(),None
     ));
-
+ thread::sleep(Duration::from_secs(4));
     loop {
         if let Ok(event) = receiver.recv() {
             match event {
@@ -200,16 +199,27 @@ impl Default for PeerData {
             address: "127.0.0.1:8080".to_string(),
             raptor_udp_port: 0,
             quic_port: 0,
-            node_type: NodeType::HARVESTER,
+            node_type: NodeType::Validator,
         }
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub enum NodeType {
-    HARVESTER,
-    FARMER,
-    Unknown,
+    /// A Node that can archive, validate and mine tokens
+    Full = 0,
+    /// Same as `NodeType::Full` but without archiving capabilities
+    Light = 1,
+    /// Archives all transactions processed in the blockchain
+    Archive = 2,
+    /// Mining node
+    Miner = 3,
+    Bootstrap = 4,
+    Validator = 5,
+    MasterNode = 6,
+    RPCNode = 7,
+    Farmer = 8,
+    Unknown = 100,
 }
 
 impl fmt::Display for NodeType {
@@ -223,8 +233,9 @@ impl FromStr for NodeType {
 
     fn from_str(input: &str) -> Result<NodeType, Self::Err> {
         match input {
-            "FARMER" => Ok(FARMER),
-            "HARVESTER" => Ok(HARVESTER),
+            "Farmer" => Ok(NodeType::Farmer),
+            "Harvester" => Ok(NodeType::Validator),
+            "Validator" => Ok(NodeType::Validator),
             _ => Err(()),
         }
     }

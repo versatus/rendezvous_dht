@@ -1,6 +1,5 @@
 use crate::key::Key;
 use crate::node::node_data::NodeData;
-use crate::protocol::NodeType::{FARMER, HARVESTER};
 use crate::MESSAGE_LENGTH;
 use log::warn;
 use serde_derive::{Deserialize, Serialize};
@@ -174,7 +173,7 @@ impl Default for PeerData {
             address: "127.0.0.1:8080".parse().unwrap(),
             raptor_udp_port: 0,
             quic_port: 0,
-            node_type: NodeType::HARVESTER,
+            node_type: NodeType::Validator,
         }
     }
 }
@@ -183,10 +182,22 @@ impl Default for PeerData {
 /// farmer,harvester etc node.
 #[derive(Clone, Debug, Serialize, Deserialize, Hash, Eq, PartialEq)]
 pub enum NodeType {
-    HARVESTER,
-    FARMER,
-    Unknown,
+    /// A Node that can archive, validate and mine tokens
+    Full = 0,
+    /// Same as `NodeType::Full` but without archiving capabilities
+    Light = 1,
+    /// Archives all transactions processed in the blockchain
+    Archive = 2,
+    /// Mining node
+    Miner = 3,
+    Bootstrap = 4,
+    Validator = 5,
+    MasterNode = 6,
+    RPCNode = 7,
+    Farmer = 8,
+    Unknown = 100,
 }
+
 
 impl fmt::Display for NodeType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -199,8 +210,9 @@ impl FromStr for NodeType {
 
     fn from_str(input: &str) -> Result<NodeType, Self::Err> {
         match input {
-            "FARMER" => Ok(FARMER),
-            "HARVESTER" => Ok(HARVESTER),
+            "Farmer" => Ok(NodeType::Farmer),
+            "Harvester" => Ok(NodeType::Validator),
+            "Validator" => Ok(NodeType::Validator),
             _ => Err(()),
         }
     }
