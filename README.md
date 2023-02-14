@@ -17,7 +17,7 @@ The protocol works as follows:
     
 - Any node willing to have information about Quorum, connect to the Rendezvous node and gets Quorum Peers with the Quorum Key namespace
     
-- Rendezevous Node will ping for all quorum peers liveness
+- Rendezevous Node will ping for all quorum peers for liveness
 
  
 
