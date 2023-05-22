@@ -40,3 +40,6 @@ const NAME_SPACES: &'static [&'static str] =
 
 /// The number of times node is not reachable.
 const UNREACHABLE_THRESDHOLD: u8 = 20;
+
+/// `NUMBER_PEER_DATA_TO_SEND`  the number of peer data to send during request peers operation.
+const NUMBER_PEER_DATA_TO_SEND:usize=3;

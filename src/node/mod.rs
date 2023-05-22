@@ -9,8 +9,8 @@ use crate::protocol::{
 use crate::routing::{RoutingBucket, RoutingTable};
 use crate::storage::Storage;
 use crate::{
-    BUCKET_REFRESH_INTERVAL, CONCURRENCY_PARAM, KEY_LENGTH, NAME_SPACES, PING_TIME_INTERVAL,
-    REPLICATION_PARAM, REQUEST_TIMEOUT, UNREACHABLE_THRESDHOLD,
+    BUCKET_REFRESH_INTERVAL, CONCURRENCY_PARAM, KEY_LENGTH, NAME_SPACES, NUMBER_PEER_DATA_TO_SEND,
+    PING_TIME_INTERVAL, REPLICATION_PARAM, REQUEST_TIMEOUT, UNREACHABLE_THRESDHOLD,
 };
 use hbbft::crypto::{PublicKeyShare, SignatureShare};
 use laminar::{Config, Packet, Socket, SocketEvent};
@@ -23,11 +23,16 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
+use cuckoofilter::{CuckooFilter, ExportedCuckooFilter};
+use rand::seq::SliceRandom;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
+pub type ExportedFilter = Vec<u8>;
 /// A node in the Kademlia DHT.
 #[derive(Clone)]
 pub struct Node {
@@ -149,7 +154,7 @@ impl Node {
                             if peer_data.quic_port == 0 {
                                 continue;
                             }
-                            println!("Pinging Address {:?}", peer_data.address);
+                            info!("Pinging Address {:?}", peer_data.address);
                             if let Ok(server) = peer_data.address.parse::<SocketAddr>() {
                                 let request = Data::Request(RendezvousRequest::Ping);
                                 let req_bytes = bincode::serialize(&request).unwrap();
@@ -242,19 +247,21 @@ impl Node {
                         let packet_sender = request.0.clone();
                         match request.1 {
                             Data::Request(rendezvous_request) => match rendezvous_request {
-                                RendezvousRequest::Peers(peers) => {
-                                    if let Some(peers_data) = new_node.get(&Node::get_key(&peers)) {
+                                RendezvousRequest::Peers(quorum_key, already_recieved) => {
+                                    if let Some((peers_data, filter)) =
+                                        new_node.get(&Node::get_key(&quorum_key), already_recieved)
+                                    {
                                         let new_peers: Vec<_> =
                                             peers_data.into_iter().map(|x| x.clone()).collect();
-                                        let data = bincode::serialize(&Data::Response(
-                                            RendezvousResponse::Peers(new_peers),
-                                        ))
-                                        .unwrap();
-                                        let _ = sender.send(Packet::reliable_ordered(
-                                            packet_sender,
-                                            data,
-                                            None,
-                                        ));
+                                        if let Ok(data) = bincode::serialize(&Data::Response(
+                                            RendezvousResponse::Peers(quorum_key,new_peers, filter),
+                                        )) {
+                                            let _ = sender.send(Packet::reliable_ordered(
+                                                packet_sender,
+                                                data,
+                                                None,
+                                            ));
+                                        }
                                     }
                                 }
 
@@ -278,31 +285,30 @@ impl Node {
                                         peer_data.quic_port,
                                         peer_data.node_type.to_string(),
                                     );
-                                    let new_data = bincode::serialize(&Data::Response(
+                                    if let Ok(new_data) = bincode::serialize(&Data::Response(
                                         RendezvousResponse::PeerRegistered,
-                                    ))
-                                    .unwrap();
-                                    let _ = sender.send(Packet::reliable_ordered(
-                                        packet_sender,
-                                        new_data,
-                                        None,
-                                    ));
+                                    )) {
+                                        let _ = sender.send(Packet::reliable_ordered(
+                                            packet_sender,
+                                            new_data,
+                                            None,
+                                        ));
+                                    }
                                 }
                                 RendezvousRequest::Namespace(namespace_type, quorum_key) => {
-                                    let status = new_node.register_namespace(
+                                    let _ = new_node.register_namespace(
                                         Node::get_key(&namespace_type),
                                         quorum_key,
                                     );
-                                    println!("Registration status :{:?}", status);
-                                    let new_data = bincode::serialize(&Data::Response(
+                                    if let Ok(new_data) = bincode::serialize(&Data::Response(
                                         RendezvousResponse::NamespaceRegistered,
-                                    ))
-                                    .unwrap();
-                                    let _ = sender.send(Packet::reliable_ordered(
-                                        packet_sender,
-                                        new_data,
-                                        None,
-                                    ));
+                                    )) {
+                                        let _ = sender.send(Packet::reliable_ordered(
+                                            packet_sender,
+                                            new_data,
+                                            None,
+                                        ));
+                                    }
                                 }
                                 _ => {}
                             },
@@ -328,7 +334,7 @@ impl Node {
                                 _ => {}
                             },
                             Data::Request(request) => match request {
-                                RendezvousRequest::Peers(_peers) => {
+                                RendezvousRequest::Peers(_peers, _filter) => {
                                     let _ = request_sender.send((packet.addr(), new_msg));
                                 }
                                 RendezvousRequest::RegisterPeer(
@@ -349,7 +355,7 @@ impl Node {
                         }
                     }
                     SocketEvent::Timeout(address) => {
-                        println!("Client timed out: {}", address);
+                        info!("Client timed out: {}", address);
                         let _ = ping_status_sender.send((address, false));
                     }
                     _ => {}
@@ -1069,11 +1075,50 @@ impl Node {
         }
     }
 
+    pub fn create_hash(peer_data: &PeerData) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        peer_data.address.hash(&mut hasher);
+      //  peer_data.raptor_udp_port.hash(&mut hasher);
+      //  peer_data.quic_port.hash(&mut hasher);
+        hasher.finish()
+    }
     /// Gets the value associated with a particular key in the DHT. Returns `None` if the key was
     /// not found.
-    pub fn get(&mut self, key: &Key) -> Option<HashSet<PeerData>> {
+    pub fn get(
+        &mut self,
+        key: &Key,
+        values_received: ExportedFilter,
+    ) -> Option<(HashSet<PeerData>, ExportedFilter)> {
         if let ResponsePayload::Value(value) = self.lookup_nodes(key, false, false) {
-            Some(value)
+            let mut filter: CuckooFilter<DefaultHasher> = CuckooFilter::with_capacity(500);
+            for peer_data in value.iter() {
+                let hash = Node::create_hash(peer_data);
+                let _ = filter.add(&hash);
+            }
+            let exported_filter = filter.export();
+            let saved = serde_json::to_string(&exported_filter).unwrap();
+            let mut new_values = HashSet::new();
+            if values_received.len() > 0 {
+                let restore_string = String::from_utf8_lossy(&values_received).to_string();
+                if let Ok(restore_json) =
+                    serde_json::from_str::<ExportedCuckooFilter>(&restore_string)
+                {
+                    let recovered_filter = CuckooFilter::<DefaultHasher>::from(restore_json);
+                    for peer_data in value.iter() {
+                        let hash = Node::create_hash(peer_data);
+                        if !recovered_filter.contains(&hash) {
+                            new_values.insert(peer_data.clone());
+                        }
+                    }
+                }
+            } else {
+                let mut rng = rand::thread_rng();
+                let values: Vec<PeerData> = value.iter().cloned().collect();
+                let random_peers = values.choose_multiple(&mut rng, NUMBER_PEER_DATA_TO_SEND);
+                let random_peers: HashSet<_> = random_peers.collect();
+                new_values = random_peers.iter().map(|&data| data.clone()).collect();
+            }
+            Some((new_values, saved.as_bytes().to_vec()))
         } else {
             None
         }

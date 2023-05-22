@@ -1,5 +1,6 @@
 use crate::key::Key;
 use crate::node::node_data::NodeData;
+use crate::node::ExportedFilter;
 use crate::MESSAGE_LENGTH;
 use log::warn;
 use serde_derive::{Deserialize, Serialize};
@@ -123,7 +124,7 @@ pub enum Data {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RendezvousRequest {
     Ping,
-    Peers(Vec<u8>),
+    Peers(Vec<u8>, ExportedFilter),
     Namespace(Vec<u8>, Vec<u8>),
     RegisterPeer(
         QuorumPublicKey,
@@ -140,7 +141,7 @@ pub enum RendezvousRequest {
 pub enum RendezvousResponse {
     Pong,
     RequestPeers(Vec<u8>),
-    Peers(Vec<PeerData>),
+    Peers(Vec<u8>,Vec<PeerData>, ExportedFilter),
     PeerRegistered,
     NamespaceRegistered,
 }
@@ -198,7 +199,6 @@ pub enum NodeType {
     Unknown = 100,
 }
 
-
 impl fmt::Display for NodeType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -209,11 +209,11 @@ impl FromStr for NodeType {
     type Err = ();
 
     fn from_str(input: &str) -> Result<NodeType, Self::Err> {
-        match input {
-            "Farmer" => Ok(NodeType::Farmer),
-            "Harvester" => Ok(NodeType::Validator),
-            "Validator" => Ok(NodeType::Validator),
-            _ => Err(()),
+        match input.to_ascii_lowercase().as_str() {
+            "farmer" => Ok(NodeType::Farmer),
+            "farvester" => Ok(NodeType::Validator),
+            "validator" => Ok(NodeType::Validator),
+            _ => Ok(NodeType::Full),
         }
     }
 }

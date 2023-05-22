@@ -11,6 +11,7 @@ use std::{io::stdin, time::Duration};
 use crate::Data::Request;
 use crate::Data::Response;
 use bincode::{deserialize, serialize};
+use cuckoofilter::ExportedCuckooFilter;
 use serde_derive::{Deserialize, Serialize};
 
 const SERVER: &str = "127.0.0.1:9090";
@@ -95,9 +96,9 @@ fn client() -> Result<(), ErrorKind> {
         )))
             .unwrap(),None
     ));
- thread::sleep(Duration::from_secs(4));
     loop {
         if let Ok(event) = receiver.recv() {
+            println!("Received event :{:?}", event);
             match event {
                 SocketEvent::Packet(packet) => {
                     if packet.addr() == server {
@@ -111,23 +112,24 @@ fn client() -> Result<(), ErrorKind> {
                                         packet.addr(),
                                         bincode::serialize(&response).unwrap(),
                                     ));
-                                    if i == 2 {
-                                        println!("Requesting new peers");
-                                        let peers = Data::Request(RendezvousRequest::Peers(
-                                            quorum_key.clone(),
-                                        ));
-                                        let req_bytes = bincode::serialize(&peers).unwrap();
-                                        let _ = sender.send(Packet::reliable_ordered(
-                                            server, req_bytes, None,
-                                        ));
-                                        i = 0;
-                                    };
+                                    //  if i == 2 {
+                                    println!("Requesting new peers");
+                                    let peers = Data::Request(RendezvousRequest::Peers(
+                                        quorum_key.clone(),
+                                        vec![],
+                                    ));
+                                    let req_bytes = bincode::serialize(&peers).unwrap();
+                                    let _ = sender
+                                        .send(Packet::reliable_ordered(server, req_bytes, None));
+                                    i = 0;
+                                    //     };
                                     i = i + 1
                                 }
                                 _ => {}
                             },
                             Response(res) => match res {
-                                RendezvousResponse::Peers(peers) => {
+                                RendezvousResponse::Peers(quorum_key,peers, filter) => {
+                                    println!("quorum_key :{:?}", hex::encode(quorum_key));
                                     for peer in peers.iter() {
                                         println!("Peers in Quorum are {:?}", peer);
                                     }
@@ -171,7 +173,7 @@ pub enum Data {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RendezvousRequest {
     Ping,
-    Peers(Vec<u8>),
+    Peers(Vec<u8>, Vec<u8>),
     Namespace(Vec<u8>, Vec<u8>),
     RegisterPeer(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, PeerData),
 }
@@ -180,7 +182,7 @@ pub enum RendezvousRequest {
 pub enum RendezvousResponse {
     Pong,
     RequestPeers(Vec<u8>),
-    Peers(Vec<PeerData>),
+    Peers(Vec<u8>,Vec<PeerData>, Vec<u8>),
     PeerRegistered,
     NamespaceRegistered,
 }

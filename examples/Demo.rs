@@ -112,8 +112,10 @@ fn main() {
                 .map(|x| x.to_string())
                 .collect();
             let key = get_key(&hex::decode(data.get(1).unwrap()).unwrap());
-            let value = node.get(&key);
-            if let Some(val) = value {
+            let value = node.get(&key, vec![]);
+            if let Some((val, filter)) = value {
+                println!("Filter fetched :{:?}", val);
+
                 for v in val.iter() {
                     println!("Value for GET {:?} : {:?}", key, v);
                 }
