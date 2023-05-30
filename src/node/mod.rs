@@ -254,7 +254,9 @@ impl Node {
                                         let new_peers: Vec<_> =
                                             peers_data.into_iter().map(|x| x.clone()).collect();
                                         if let Ok(data) = bincode::serialize(&Data::Response(
-                                            RendezvousResponse::Peers(quorum_key,new_peers, filter),
+                                            RendezvousResponse::Peers(
+                                                quorum_key, new_peers, filter,
+                                            ),
                                         )) {
                                             let _ = sender.send(Packet::reliable_ordered(
                                                 packet_sender,
@@ -310,12 +312,32 @@ impl Node {
                                         ));
                                     }
                                 }
+                                RendezvousRequest::FetchNameSpace(quorum_type) => {
+                                    info!("Fetch Namespace {:?}", quorum_type);
+                                    if let Some(namespaces) =
+                                        new_node.get_namespaces(&Node::get_key(&quorum_type))
+                                    {
+                                        let namespaces: Vec<Vec<u8>> = namespaces
+                                            .into_iter()
+                                            .map(|s| s.into_bytes())
+                                            .collect();
+                                        if let Ok(new_data) = bincode::serialize(&Data::Response(
+                                            RendezvousResponse::Namespaces(namespaces.clone()),
+                                        )) {
+                                            let _ = sender.send(Packet::reliable_ordered(
+                                                packet_sender,
+                                                new_data,
+                                                None,
+                                            ));
+                                        }
+                                    }
+                                }
                                 _ => {}
                             },
                             _ => {}
                         }
                     }
-                    Err(_) => break,
+                    Err(e) => break,
                 }
             }
         });
@@ -348,6 +370,9 @@ impl Node {
                                     let _ = request_sender.send((packet.addr(), new_msg));
                                 }
                                 RendezvousRequest::Namespace(_namespace_type, _quorum_key) => {
+                                    let _ = request_sender.send((packet.addr(), new_msg));
+                                },
+                                RendezvousRequest::FetchNameSpace(namespace) => {
                                     let _ = request_sender.send((packet.addr(), new_msg));
                                 }
                                 _ => {}
@@ -1078,8 +1103,8 @@ impl Node {
     pub fn create_hash(peer_data: &PeerData) -> u64 {
         let mut hasher = DefaultHasher::new();
         peer_data.address.hash(&mut hasher);
-      //  peer_data.raptor_udp_port.hash(&mut hasher);
-      //  peer_data.quic_port.hash(&mut hasher);
+        //  peer_data.raptor_udp_port.hash(&mut hasher);
+        //  peer_data.quic_port.hash(&mut hasher);
         hasher.finish()
     }
     /// Gets the value associated with a particular key in the DHT. Returns `None` if the key was

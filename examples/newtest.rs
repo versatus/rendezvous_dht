@@ -24,7 +24,7 @@ fn client() -> Result<(), ErrorKind> {
         addr,
         Config {
             blocking_mode: false,
-            idle_connection_timeout: Duration::from_secs(5),
+            idle_connection_timeout: Duration::from_secs(10),
             heartbeat_interval: None,
             max_packet_size: (16 * 1024) as usize,
             max_fragments: 16 as u8,
@@ -34,12 +34,13 @@ fn client() -> Result<(), ErrorKind> {
             rtt_smoothing_factor: 0.10,
             rtt_max_value: 250,
             socket_event_buffer_size: 1024,
-            socket_polling_timeout: Some(Duration::from_millis(2000)),
+            socket_polling_timeout: Some(Duration::from_millis(10000)),
             max_packets_in_flight: 512,
             max_unestablished_connections: 50,
         },
     )
-    .unwrap();
+        .unwrap();
+
     println!("Connected on {}", addr);
 
     let server = SERVER.parse().unwrap();
@@ -48,63 +49,20 @@ fn client() -> Result<(), ErrorKind> {
     thread::spawn(move || {
         socket.start_polling();
     });
-    let mut i = 0;
-    let quorum_key=hex::decode("aa4a1fc44e1fc58e17c82c3b5851747e3472405d4b95114e0f2bb943f5e48f3730731a0632a5b31f88038d3e2e657419").unwrap();
 
-    let _ = sender.send(Packet::reliable_ordered(
-        server,
-        bincode::serialize(&Data::Request(RendezvousRequest::Namespace(
-            "FARMER".to_string().as_bytes().to_vec(),
-            quorum_key.clone(),
-        )))
-        .unwrap(),
-        None,
+    let payload=Request(RendezvousRequest::FetchNameSpace(
+        "FARMER".to_string().as_bytes().to_vec(),
     ));
 
-    let _ = sender.send(Packet::reliable_ordered(
+
+    let s = sender.send(Packet::reliable_unordered(
         server,
-        bincode::serialize(&Data::Request(RendezvousRequest::FetchNameSpace(
-            "FARMER".to_string().as_bytes().to_vec(),
-        )))
+        serialize(&payload)
             .unwrap(),
-        None,
     ));
+    println!("Status :{:?}",s);
 
-    let _ = sender.send(Packet::reliable_ordered(
-        server,
-        bincode::serialize(&Data::Request(RendezvousRequest::RegisterPeer(
-            quorum_key.clone(),
-            "FARMER".to_string().as_bytes().to_vec(),
-            hex::decode("a8f8d3a389cd62397112f9fdd20e84fa122ac0d1e69d2ebd1cc3325ba3ac34fa2f26db75112128ab2d0a48ba81d63645").unwrap(),
-            hex::decode("b7be0d2cbc712860e983ab1d80fe08fa122fd86111de8277a350c336065de658cc17a6d69511ee9a31c09aad3ac10f64123706abe84f00fc850872787dd7412851f83de0fea915548434f669613f92d3af44ca21547a8edcd2731c8ab39668d5").unwrap(),
-            "HelloVrrb".to_string().as_bytes().to_vec(),
-            PeerData {
-                address: "127.0.0.1:6060".to_string(),
-                raptor_udp_port: 8082,
-                quic_port: 8083,
-                node_type: NodeType::Farmer,
-            },
-        )))
-        .unwrap(),None
-    ));
 
-    let _ = sender.send(Packet::reliable_ordered(
-        server,
-        bincode::serialize(&Data::Request(RendezvousRequest::RegisterPeer(
-            quorum_key.clone(),
-            "FARMER".to_string().as_bytes().to_vec(),
-            hex::decode("a8f8d3a389cd62397112f9fdd20e84fa122ac0d1e69d2ebd1cc3325ba3ac34fa2f26db75112128ab2d0a48ba81d63645").unwrap(),
-            hex::decode("b7be0d2cbc712860e983ab1d80fe08fa122fd86111de8277a350c336065de658cc17a6d69511ee9a31c09aad3ac10f64123706abe84f00fc850872787dd7412851f83de0fea915548434f669613f92d3af44ca21547a8edcd2731c8ab39668d5").unwrap(),
-            "HelloVrrb".to_string().as_bytes().to_vec(),
-            PeerData {
-                address: "127.0.0.1:6062".to_string(),
-                raptor_udp_port: 8082,
-                quic_port: 8083,
-                node_type: NodeType::Farmer,
-            },
-        )))
-            .unwrap(),None
-    ));
     loop {
         if let Ok(event) = receiver.recv() {
             println!("Received event :{:?}", event);
@@ -117,32 +75,15 @@ fn client() -> Result<(), ErrorKind> {
                             Request(req) => match req {
                                 RendezvousRequest::Ping => {
                                     let response = &Data::Response(RendezvousResponse::Pong);
-                                    sender.send(Packet::reliable_unordered(
+                                    let _ = sender.send(Packet::reliable_unordered(
                                         packet.addr(),
                                         bincode::serialize(&response).unwrap(),
                                     ));
-                                    println!("Requesting new peers");
-                                    let peers = Data::Request(RendezvousRequest::Peers(
-                                        quorum_key.clone(),
-                                        vec![],
-                                    ));
-                                    let req_bytes = bincode::serialize(&peers).unwrap();
-                                    let _ = sender
-                                        .send(Packet::reliable_ordered(server, req_bytes, None));
-
-                                    println!("Requesting namespaces");
-                                    let peers = Data::Request(RendezvousRequest::FetchNameSpace(
-                                        "FARMER".to_string().as_bytes().to_vec(),
-                                    ));
-                                    let req_bytes = bincode::serialize(&peers).unwrap();
-                                    let _ = sender
-                                        .send(Packet::reliable_ordered(server, req_bytes, None));
-
                                 }
                                 _ => {}
                             },
                             Response(res) => match res {
-                                RendezvousResponse::Peers(quorum_key,peers, filter) => {
+                                RendezvousResponse::Peers(quorum_key, peers, filter) => {
                                     println!("quorum_key :{:?}", hex::encode(quorum_key));
                                     for peer in peers.iter() {
                                         println!("Peers in Quorum are {:?}", peer);
@@ -154,10 +95,8 @@ fn client() -> Result<(), ErrorKind> {
                                 RendezvousResponse::PeerRegistered => {
                                     println!("Peer Registered");
                                 },
-                                RendezvousResponse::Namespaces(namespaces) =>{
-                                    for namespace in namespaces.iter() {
-                                        println!("Namespaces:{:?}",String::from_utf8_lossy(namespace));
-                                    }
+                                RendezvousResponse::Namespaces(namespaces) => {
+                                    println!("Namespaces:{:?}", namespaces);
                                 }
 
                                 _ => {}
@@ -168,14 +107,13 @@ fn client() -> Result<(), ErrorKind> {
                         println!("Unknown sender.");
                     }
                 }
-                SocketEvent::Timeout(_) => {}
                 _ =>
-                    //println!("Silence.."),
-                    {}
+                    {
+                        println!("Received unknown.");
+                    }
             }
         }
     }
-
     Ok(())
 }
 
@@ -197,7 +135,6 @@ pub enum RendezvousRequest {
     RegisterPeer(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, PeerData),
     FetchNameSpace(Vec<u8>)
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RendezvousResponse {
     Pong,

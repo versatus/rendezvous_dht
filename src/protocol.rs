@@ -134,6 +134,7 @@ pub enum RendezvousRequest {
         Payload,
         PeerData,
     ),
+    FetchNameSpace(Vec<u8>)
 }
 
 /// A enum that is used to send messages between nodes.
@@ -144,6 +145,7 @@ pub enum RendezvousResponse {
     Peers(Vec<u8>,Vec<PeerData>, ExportedFilter),
     PeerRegistered,
     NamespaceRegistered,
+    Namespaces(Vec<Vec<u8>>)
 }
 
 /// `PeerData` is a struct that contains a `String` (`address`), two `u16`s (`raptor_udp_port` and
