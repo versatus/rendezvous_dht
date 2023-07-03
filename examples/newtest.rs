@@ -39,7 +39,7 @@ fn client() -> Result<(), ErrorKind> {
             max_unestablished_connections: 50,
         },
     )
-        .unwrap();
+    .unwrap();
 
     println!("Connected on {}", addr);
 
@@ -50,70 +50,111 @@ fn client() -> Result<(), ErrorKind> {
         socket.start_polling();
     });
 
-    let payload=Request(RendezvousRequest::FetchNameSpace(
+    //Namespace Registration
+    let payload=Request(RendezvousRequest::Namespace(
+            "FARMER".to_string().as_bytes().to_vec(),
+            hex::decode("aa4a1fc44e1fc58e17c82c3b5851747e3472405d4b95114e0f2bb943f5e48f3730731a0632a5b31f88038d3e2e657419".to_string()).unwrap()
+    ));
+
+    let _ = sender.send(Packet::reliable_ordered(
+        server,
+        serialize(&payload).unwrap(),
+        Some(1),
+    ));
+
+    //Fetching namespace
+    let payload = Request(RendezvousRequest::FetchNameSpace(
         "FARMER".to_string().as_bytes().to_vec(),
     ));
 
-
-    let s = sender.send(Packet::reliable_unordered(
+    let _ = sender.send(Packet::reliable_ordered(
         server,
-        serialize(&payload)
-            .unwrap(),
+        serialize(&payload).unwrap(),
+        Some(1),
     ));
-    println!("Status :{:?}",s);
 
+    //Peer Registration
+    let payload=Request(RendezvousRequest::RegisterPeer(
+            hex::decode("aa4a1fc44e1fc58e17c82c3b5851747e3472405d4b95114e0f2bb943f5e48f3730731a0632a5b31f88038d3e2e657419".to_string()).unwrap(),
+             "FARMER".to_string().as_bytes().to_vec(),
+            hex::decode("a8f8d3a389cd62397112f9fdd20e84fa122ac0d1e69d2ebd1cc3325ba3ac34fa2f26db75112128ab2d0a48ba81d63645".to_string()).unwrap(),
+             hex::decode("b7be0d2cbc712860e983ab1d80fe08fa122fd86111de8277a350c336065de658cc17a6d69511ee9a31c09aad3ac10f64123706abe84f00fc850872787dd7412851f83de0fea915548434f669613f92d3af44ca21547a8edcd2731c8ab39668d5".to_string()).unwrap(),
+             "HelloVrrb".as_bytes().to_vec(),
+             PeerData{
+                 address:"127.0.0.1:6061".to_string(),
+                 raptor_udp_port:8082,
+                 quic_port:8083,
+                 node_type:NodeType::Farmer
+             }
+
+    ));
+
+    let _ = sender.send(Packet::reliable_ordered(
+        server,
+        serialize(&payload).unwrap(),
+        Some(1),
+    ));
+
+    //Fetching peer
+    let payload = Request(RendezvousRequest::Peers(
+          hex::decode("aa4a1fc44e1fc58e17c82c3b5851747e3472405d4b95114e0f2bb943f5e48f3730731a0632a5b31f88038d3e2e657419".to_string()).unwrap(),
+          Vec::new()
+        ));
+
+    let _ = sender.send(Packet::reliable_ordered(
+        server,
+        serialize(&payload).unwrap(),
+        Some(1),
+    ));
 
     loop {
         if let Ok(event) = receiver.recv() {
-            println!("Received event :{:?}", event);
             match event {
-                SocketEvent::Packet(packet) => {
-                    if packet.addr() == server {
-                        let payload_response: Data =
-                            bincode::deserialize(packet.payload()).unwrap();
-                        match payload_response {
-                            Request(req) => match req {
-                                RendezvousRequest::Ping => {
-                                    let response = &Data::Response(RendezvousResponse::Pong);
-                                    let _ = sender.send(Packet::reliable_unordered(
-                                        packet.addr(),
-                                        bincode::serialize(&response).unwrap(),
-                                    ));
-                                }
-                                _ => {}
-                            },
-                            Response(res) => match res {
-                                RendezvousResponse::Peers(quorum_key, peers, filter) => {
-                                    println!("quorum_key :{:?}", hex::encode(quorum_key));
-                                    for peer in peers.iter() {
-                                        println!("Peers in Quorum are {:?}", peer);
-                                    }
-                                }
-                                RendezvousResponse::NamespaceRegistered => {
-                                    println!("Namespace Registered");
-                                }
-                                RendezvousResponse::PeerRegistered => {
-                                    println!("Peer Registered");
-                                },
-                                RendezvousResponse::Namespaces(namespaces) => {
-                                    println!("Namespaces:{:?}", namespaces);
-                                }
-
-                                _ => {}
-                            },
+                SocketEvent::Packet(packet) if packet.addr() == server => {
+                    match bincode::deserialize(packet.payload()) {
+                        Ok(Data::Request(req)) => match req {
+                            RendezvousRequest::Ping => {
+                                let response = Data::Response(RendezvousResponse::Pong);
+                                let _ = sender.send(Packet::reliable_unordered(
+                                    packet.addr(),
+                                    bincode::serialize(&response).unwrap(),
+                                ));
+                            }
                             _ => {}
-                        }
-                    } else {
-                        println!("Unknown sender.");
+                        },
+                        Ok(Data::Response(res)) => match res {
+                            RendezvousResponse::Peers(quorum_key, peers, filter) => {
+                                println!("quorum_key: {:?}", hex::encode(quorum_key));
+                                for peer in peers.iter() {
+                                    println!("Peers in Quorum are {:?}", peer);
+                                }
+                            }
+                            RendezvousResponse::NamespaceRegistered => {
+                                println!("Namespace Registered");
+                            }
+                            RendezvousResponse::PeerRegistered => {
+                                println!("Peer Registered");
+                            }
+                            RendezvousResponse::Namespaces(namespaces) => {
+                                for namespace in namespaces.iter() {
+                                    println!(
+                                        "Namespace fetched: {:?}",
+                                        String::from_utf8_lossy(namespace)
+                                    );
+                                }
+                            }
+                            _ => {}
+                        },
+                        _ => {}
                     }
                 }
-                _ =>
-                    {
-                        println!("Received unknown.");
-                    }
+                _ => {
+                    println!("Received unknown.");
+                }
             }
         }
     }
+
     Ok(())
 }
 
@@ -133,16 +174,16 @@ pub enum RendezvousRequest {
     Peers(Vec<u8>, Vec<u8>),
     Namespace(Vec<u8>, Vec<u8>),
     RegisterPeer(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, PeerData),
-    FetchNameSpace(Vec<u8>)
+    FetchNameSpace(Vec<u8>),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RendezvousResponse {
     Pong,
     RequestPeers(Vec<u8>),
-    Peers(Vec<u8>,Vec<PeerData>, Vec<u8>),
+    Peers(Vec<u8>, Vec<PeerData>, Vec<u8>),
     PeerRegistered,
     NamespaceRegistered,
-    Namespaces(Vec<Vec<u8>>)
+    Namespaces(Vec<Vec<u8>>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Hash)]
