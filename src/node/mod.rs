@@ -10,7 +10,7 @@ use crate::routing::{RoutingBucket, RoutingTable};
 use crate::storage::Storage;
 use crate::{
     BUCKET_REFRESH_INTERVAL, CONCURRENCY_PARAM, KEY_LENGTH, NAME_SPACES, NUMBER_PEER_DATA_TO_SEND,
-    PING_TIME_INTERVAL, REPLICATION_PARAM, REQUEST_TIMEOUT, UNREACHABLE_THRESDHOLD,
+    PING_TIME_INTERVAL, REPLICATION_PARAM, REQUEST_TIMEOUT, RETRY_ATTEMPTS, UNREACHABLE_THRESDHOLD,
 };
 use hbbft::crypto::{PublicKeyShare, SignatureShare};
 use laminar::{Config, Packet, Socket, SocketEvent};
@@ -27,10 +27,12 @@ use cuckoofilter::{CuckooFilter, ExportedCuckooFilter};
 use rand::seq::SliceRandom;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
+use tracing::error;
 
 pub type ExportedFilter = Vec<u8>;
 /// A node in the Kademlia DHT.
@@ -43,7 +45,6 @@ pub struct Node {
     pending_requests: Arc<Mutex<HashMap<Key, Sender<Response>>>>,
     protocol: Arc<Protocol>,
     is_active: Arc<AtomicBool>,
-    rendezvous_address: SocketAddr,
 }
 
 #[derive(Error, Debug)]
@@ -62,18 +63,24 @@ impl Node {
     /// Constructs a new `Node` on a specific ip and port, and bootstraps the node with an existing
     /// node if `bootstrap` is not `None`.
     pub fn new(
-        ip: &str,
-        port: &str,
+        addr: SocketAddr,
         bootstrap: Option<NodeData>,
         rendezvous_address: SocketAddr,
-    ) -> Self {
-        let addr = format!("{}:{}", ip, port);
-        let socket = UdpSocket::bind(addr).expect("Error: could not bind to address.");
+    ) -> Result<Self, io::Error> {
+        let socket = UdpSocket::bind(addr).map_err(|err| {
+            error!("Error: could not bind to address: {}", err);
+            err
+        })?;
+        let addr = socket.local_addr().map_err(|err| {
+            error!(
+                "Error occurred while fetching local addr from socket :{}",
+                err
+            );
+            err
+        })?;
         let node_data = Arc::new(NodeData {
-            ip: ip.to_string(),
-            port: port.to_string(),
-            addr: socket.local_addr().unwrap().to_string(),
             id: Key::rand(),
+            addr,
         });
         let mut routing_table = RoutingTable::new(Arc::clone(&node_data));
         let (message_tx, message_rx) = channel();
@@ -91,16 +98,13 @@ impl Node {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             protocol: Arc::new(protocol),
             is_active: Arc::new(AtomicBool::new(true)),
-            rendezvous_address,
         };
         let (ping_status_sender, ping_status_receiver) = channel::<(SocketAddr, bool)>();
-        // let mut socket = Socket::bind(rendezvous_address).unwrap();
-
         let mut socket = Socket::bind_with_config(
             rendezvous_address,
             Config {
                 blocking_mode: false,
-                idle_connection_timeout: Duration::from_secs(5),
+                idle_connection_timeout: Duration::from_secs(20),
                 heartbeat_interval: None,
                 max_packet_size: (16 * 1024) as usize,
                 max_fragments: 16 as u8,
@@ -125,7 +129,7 @@ impl Node {
         ret.check_nodes_liveness();
         ret.check_registered_peer_liveliness(ping_status_receiver, sender.clone());
         ret.process_received_request(ping_status_sender, sender, receiver);
-        ret
+        Ok(ret)
     }
 
     /// It spawns a thread that periodically pings all the peers in the quorum and if a peer is
@@ -157,9 +161,18 @@ impl Node {
                             info!("Pinging Address {:?}", peer_data.address);
                             if let Ok(server) = peer_data.address.parse::<SocketAddr>() {
                                 let request = Data::Request(RendezvousRequest::Ping);
-                                let req_bytes = bincode::serialize(&request).unwrap();
-                                let _ =
-                                    sender.send(Packet::reliable_ordered(server, req_bytes, None));
+                                let req_bytes = match bincode::serialize(&request) {
+                                    Ok(bytes) => bytes,
+                                    Err(err) => {
+                                        error!("Error while serializing request: {:?}", err);
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) =
+                                    sender.send(Packet::reliable_ordered(server, req_bytes, None))
+                                {
+                                    error!("Error occured while sending packet :{:?}", e)
+                                }
                             }
                         }
                     }
@@ -332,6 +345,8 @@ impl Node {
                                         }
                                     }
                                 }
+                                RendezvousRequest::CandidateRegistration(pub_keys, socket_addr) => {
+                                }
                                 _ => {}
                             },
                             _ => {}
@@ -346,7 +361,13 @@ impl Node {
                 match event {
                     SocketEvent::Packet(packet) => {
                         let msg = packet.payload();
-                        let msg: Data = bincode::deserialize(msg).unwrap();
+                        let msg: Data = match bincode::deserialize(msg) {
+                            Ok(data) => data,
+                            Err(err) => {
+                                error!("Error while deserializing data: {:?}", err);
+                                continue;
+                            }
+                        };
                         let new_msg = msg.clone();
                         match msg {
                             Data::Response(response) => match response {
@@ -371,8 +392,8 @@ impl Node {
                                 }
                                 RendezvousRequest::Namespace(_namespace_type, _quorum_key) => {
                                     let _ = request_sender.send((packet.addr(), new_msg));
-                                },
-                                RendezvousRequest::FetchNameSpace(namespace) => {
+                                }
+                                RendezvousRequest::FetchNameSpace(_) => {
                                     let _ = request_sender.send((packet.addr(), new_msg));
                                 }
                                 _ => {}
@@ -392,7 +413,14 @@ impl Node {
     fn check_nodes_liveness(&self) {
         let mut node = self.clone();
         thread::spawn(move || loop {
-            let routing_table = node.routing_table.lock().unwrap().clone();
+            let routing_table = match node.routing_table.lock() {
+                Ok(table) => table.clone(),
+                Err(err) => {
+                    error!("Failed to obtain lock on routing table {}", err);
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
             let buckets: Vec<RoutingBucket> = routing_table.buckets.clone();
             for bucket in buckets {
                 let nodes = bucket.nodes;
@@ -452,9 +480,10 @@ impl Node {
     fn bootstrap_routing_table(&mut self) {
         let target_key = self.node_data.id;
         self.lookup_nodes(&target_key, true, false);
-
-        let bucket_size = { self.routing_table.lock().unwrap().size() };
-
+        let bucket_size = self
+            .routing_table
+            .lock()
+            .map_or(0, |routing_table| routing_table.size());
         for i in 0..bucket_size {
             self.lookup_nodes(&Key::rand_in_range(i), true, false);
         }
@@ -501,36 +530,79 @@ impl Node {
         let receiver = (*self.node_data).clone();
         let payload = match request.payload.clone() {
             RequestPayload::Ping => ResponsePayload::Pong,
-            RequestPayload::FindNode(key) => ResponsePayload::Nodes(
-                self.routing_table
-                    .lock()
-                    .unwrap()
-                    .get_closest_nodes(&key, REPLICATION_PARAM),
-            ),
-            RequestPayload::FindPeers(key) => {
-                if let Some(value) = self.storage.lock().unwrap().get_peers(&key) {
-                    ResponsePayload::Value(value.clone())
-                } else {
-                    ResponsePayload::Nodes(
-                        self.routing_table
-                            .lock()
-                            .unwrap()
-                            .get_closest_nodes(&key, REPLICATION_PARAM),
-                    )
+            RequestPayload::FindNode(key) => {
+                let mut attempt = 0;
+                loop {
+                    if let Ok(routing_table_lock) = self.routing_table.lock() {
+                        let closest_nodes =
+                            routing_table_lock.get_closest_nodes(&key, REPLICATION_PARAM);
+                        break ResponsePayload::Nodes(closest_nodes);
+                    } else {
+                        attempt += 1;
+                        if attempt >= RETRY_ATTEMPTS {
+                            break ResponsePayload::Error(
+                                "Failed to acquire lock on routing table".to_string(),
+                            );
+                        }
+                    }
                 }
             }
-            RequestPayload::FindNamespaces(key) => {
-                if let Some(value) = self.storage.lock().unwrap().get_namespaces(&key) {
-                    ResponsePayload::Namespaces(value.clone())
-                } else {
-                    ResponsePayload::Nodes(
+            RequestPayload::FindPeers(key) => match self.storage.lock() {
+                Ok(mut storage_guard) => {
+                    if let Some(value) = storage_guard.get_peers(&key) {
+                        ResponsePayload::Value(value.clone())
+                    } else {
                         self.routing_table
                             .lock()
-                            .unwrap()
-                            .get_closest_nodes(&key, REPLICATION_PARAM),
-                    )
+                            .map_err(|err| {
+                                error!("Failed to acquire routing table lock: {:?}", err);
+                            })
+                            .and_then(|routing_table_guard| {
+                                Ok(ResponsePayload::Nodes(
+                                    routing_table_guard.get_closest_nodes(&key, REPLICATION_PARAM),
+                                ))
+                            })
+                            .unwrap_or_else(|err| {
+                                ResponsePayload::Error(format!(
+                                    "Failed to acquire lock on routing_table: {:?}",
+                                    err
+                                ))
+                            })
+                    }
                 }
-            }
+                Err(err) => {
+                    format!("Failed to acquire lock on storage: {:?}", err);
+                    ResponsePayload::Error(format!("Failed to acquire lock on storage: {:?}", err))
+                }
+            },
+            RequestPayload::FindNamespaces(key) => match self.storage.lock() {
+                Ok(mut storage_guard) => {
+                    if let Some(value) = storage_guard.get_namespaces(&key) {
+                        ResponsePayload::Namespaces(value.clone())
+                    } else {
+                        self.routing_table
+                            .lock()
+                            .map_err(|err| {
+                                error!("Failed to acquire routing table lock: {:?}", err);
+                            })
+                            .and_then(|routing_table_guard| {
+                                Ok(ResponsePayload::Nodes(
+                                    routing_table_guard.get_closest_nodes(&key, REPLICATION_PARAM),
+                                ))
+                            })
+                            .unwrap_or_else(|err| {
+                                ResponsePayload::Error(format!(
+                                    "Failed to acquire lock on routing_table: {:?}",
+                                    err
+                                ))
+                            })
+                    }
+                }
+                Err(err) => {
+                    format!("Failed to acquire lock on storage: {:?}", err);
+                    ResponsePayload::Error(format!("Failed to acquire lock on storage: {:?}", err))
+                }
+            },
             RequestPayload::RegisterPeer(
                 quorum_public_key,
                 quorum_key,
@@ -547,14 +619,21 @@ impl Node {
                         )),
                         Some(_) => match SocketAddr::from_str(address.as_str()) {
                             Ok(_) => {
-                                let peer_data = PeerData {
-                                    address,
-                                    raptor_udp_port: raptor_port,
-                                    quic_port,
-                                    node_type: NodeType::from_str(node_type.as_str()).unwrap(),
-                                };
-                                storage.register_peer(quorum_public_key, peer_data);
-                                ResponsePayload::RegistrationSuccessful
+                                if let Ok(node_type) = NodeType::from_str(node_type.as_str()) {
+                                    let peer_data = PeerData {
+                                        address,
+                                        raptor_udp_port: raptor_port,
+                                        quic_port,
+                                        node_type,
+                                    };
+                                    storage.register_peer(quorum_public_key, peer_data);
+                                    ResponsePayload::RegistrationSuccessful
+                                } else {
+                                    ResponsePayload::Error(format!(
+                                        "Invalid node_type recieved :{:?}",
+                                        node_type,
+                                    ))
+                                }
                             }
                             Err(_) => ResponsePayload::RegistrationFailed,
                         },
@@ -564,18 +643,23 @@ impl Node {
                 }
             }
             RequestPayload::RegisterNameSpace(name_space, quorum_key) => {
-                let mut storage = self.storage.lock().unwrap();
-                let key = Node::get_key(&quorum_key);
-                match storage.get_peers(&name_space) {
-                    None => {
-                        storage.register_peer(key, PeerData::default());
-                        storage.register_namespace(name_space, hex::encode(quorum_key));
-                        ResponsePayload::RegistrationSuccessful
+                if let Ok(mut storage) = self.storage.lock() {
+                    let key = Node::get_key(&quorum_key);
+                    match storage.get_peers(&name_space) {
+                        None => {
+                            storage.register_peer(key, PeerData::default());
+                            storage.register_namespace(name_space, hex::encode(quorum_key));
+                            ResponsePayload::RegistrationSuccessful
+                        }
+                        Some(_) => {
+                            storage.register_namespace(name_space, hex::encode(quorum_key));
+                            ResponsePayload::RegistrationSuccessful
+                        }
                     }
-                    Some(_) => {
-                        storage.register_namespace(name_space, hex::encode(quorum_key));
-                        ResponsePayload::RegistrationSuccessful
-                    }
+                } else {
+                    ResponsePayload::Error(
+                        "Error occuring while acquiring on lock on storage".to_string(),
+                    )
                 }
             }
         };
@@ -631,19 +715,22 @@ impl Node {
     /// the response will be ignored.
     fn handle_response(&mut self, response: &Response) {
         self.clone().update_routing_table(response.receiver.clone());
-        let pending_requests = self.pending_requests.lock().unwrap();
-        let Response { ref request, .. } = response.clone();
-        if let Some(sender) = pending_requests.get(&request.id) {
-            info!(
-                "{} - Receiving response from {} {:#?}",
-                self.node_data.addr, response.receiver.addr, response.payload,
-            );
-            sender.send(response.clone()).unwrap();
-        } else {
-            warn!(
-                "{} - Original request not found; irrelevant response or expired request.",
-                self.node_data.addr
-            );
+        if let Ok(pending_requests) = self.pending_requests.lock() {
+            let Response { ref request, .. } = response.clone();
+            if let Some(sender) = pending_requests.get(&request.id) {
+                info!(
+                    "{} - Receiving response from {} {:#?}",
+                    self.node_data.addr, response.receiver.addr, response.payload,
+                );
+                if let Err(err) = sender.send(response.clone()) {
+                    error!("Error sending response: {}", err);
+                }
+            } else {
+                warn!(
+                    "{} - Original request not found; irrelevant response or expired request.",
+                    self.node_data.addr
+                );
+            }
         }
     }
 
@@ -654,39 +741,50 @@ impl Node {
             self.node_data.addr, dest.addr, payload
         );
         let (response_tx, response_rx) = channel();
-        let mut pending_requests = self.pending_requests.lock().unwrap();
         let mut token = Key::rand();
+        let result = self
+            .pending_requests
+            .lock()
+            .and_then(|mut pending_requests| {
+                while pending_requests.contains_key(&token) {
+                    token = Key::rand();
+                }
+                pending_requests.insert(token, response_tx);
+                drop(pending_requests);
 
-        while pending_requests.contains_key(&token) {
-            token = Key::rand();
-        }
-        pending_requests.insert(token, response_tx);
-        drop(pending_requests);
+                self.protocol.send_message(
+                    &Message::Request(Request {
+                        id: token,
+                        sender: (*self.node_data).clone(),
+                        payload,
+                    }),
+                    dest,
+                );
+                Ok(response_rx.recv_timeout(Duration::from_millis(REQUEST_TIMEOUT)))
+            });
 
-        self.protocol.send_message(
-            &Message::Request(Request {
-                id: token,
-                sender: (*self.node_data).clone(),
-                payload,
-            }),
-            dest,
-        );
-
-        match response_rx.recv_timeout(Duration::from_millis(REQUEST_TIMEOUT)) {
-            Ok(response) => {
-                let mut pending_requests = self.pending_requests.lock().unwrap();
-                pending_requests.remove(&token);
+        match result {
+            Ok(Ok(response)) => {
+                if let Ok(mut pending_requests) = self.pending_requests.lock() {
+                    pending_requests.remove(&token);
+                }
                 Some(response)
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 warn!(
                     "{} - Request to {} timed out after waiting for {} milliseconds",
                     self.node_data.addr, dest.addr, REQUEST_TIMEOUT
                 );
-                let mut pending_requests = self.pending_requests.lock().unwrap();
-                pending_requests.remove(&token);
-                let mut routing_table = self.routing_table.lock().unwrap();
-                routing_table.remove_node(dest);
+                if let Ok(mut pending_requests) = self.pending_requests.lock() {
+                    pending_requests.remove(&token);
+                }
+                if let Ok(mut routing_table) = self.routing_table.lock() {
+                    routing_table.remove_node(dest);
+                }
+                None
+            }
+            Err(err) => {
+                error!("Failed to acquire lock on pending_requests: {}", err);
                 None
             }
         }
@@ -805,155 +903,169 @@ impl Node {
     /// the remaining nodes in its shortlist until there are no remaining nodes or if it has found
     /// `REPLICATION_PARAM` active nodes.
     fn lookup_nodes(&mut self, key: &Key, find_node: bool, is_namespace: bool) -> ResponsePayload {
-        let routing_table = self.routing_table.lock().unwrap();
-        let closest_nodes = routing_table.get_closest_nodes(key, CONCURRENCY_PARAM);
-        drop(routing_table);
+        let routing_table_result = self.routing_table.lock().map_err(|e| {
+            ResponsePayload::Error(
+                format!("Failed to acquire lock on routing table {}", e).to_string(),
+            )
+        });
+        match routing_table_result {
+            Ok(routing_table) => {
+                let closest_nodes = routing_table.get_closest_nodes(key, CONCURRENCY_PARAM);
+                drop(routing_table);
+                let mut closest_distance = Key::new([255u8; KEY_LENGTH]);
+                for node_data in &closest_nodes {
+                    closest_distance = cmp::min(closest_distance, key.xor(&node_data.id))
+                }
+                // initialize found nodes, queried nodes, and priority queue
+                let mut found_nodes: HashSet<NodeData> =
+                    closest_nodes.clone().into_iter().collect();
+                found_nodes.insert((*self.node_data).clone());
+                let mut queried_nodes = HashSet::new();
+                queried_nodes.insert((*self.node_data).clone());
 
-        let mut closest_distance = Key::new([255u8; KEY_LENGTH]);
-        for node_data in &closest_nodes {
-            closest_distance = cmp::min(closest_distance, key.xor(&node_data.id))
-        }
-
-        // initialize found nodes, queried nodes, and priority queue
-        let mut found_nodes: HashSet<NodeData> = closest_nodes.clone().into_iter().collect();
-        found_nodes.insert((*self.node_data).clone());
-        let mut queried_nodes = HashSet::new();
-        queried_nodes.insert((*self.node_data).clone());
-
-        let mut queue: BinaryHeap<NodeDataDistancePair> = BinaryHeap::from(
-            closest_nodes
-                .into_iter()
-                .map(|node_data| NodeDataDistancePair(node_data.clone(), node_data.id.xor(key)))
-                .collect::<Vec<NodeDataDistancePair>>(),
-        );
-
-        let (tx, rx) = channel();
-
-        let mut concurrent_thread_count = 0;
-
-        // spawn initial find requests
-        for _ in 0..CONCURRENCY_PARAM {
-            if !queue.is_empty() {
-                self.clone().spawn_find_rpc(
-                    queue.pop().unwrap().0,
-                    key.clone(),
-                    tx.clone(),
-                    find_node,
-                    is_namespace,
+                let mut queue: BinaryHeap<NodeDataDistancePair> = BinaryHeap::from(
+                    closest_nodes
+                        .into_iter()
+                        .map(|node_data| {
+                            NodeDataDistancePair(node_data.clone(), node_data.id.xor(key))
+                        })
+                        .collect::<Vec<NodeDataDistancePair>>(),
                 );
-                concurrent_thread_count += 1;
-            }
-        }
+                let (tx, rx) = channel();
 
-        // loop until we could not find a closer node for a round or if no threads are running
-        while concurrent_thread_count > 0 {
-            while concurrent_thread_count < CONCURRENCY_PARAM && !queue.is_empty() {
-                self.clone().spawn_find_rpc(
-                    queue.pop().unwrap().0,
-                    key.clone(),
-                    tx.clone(),
-                    find_node,
-                    is_namespace,
-                );
-                concurrent_thread_count += 1;
-            }
+                let mut concurrent_thread_count = 0;
 
-            let mut is_terminated = true;
-            let response_opt = rx.recv().unwrap();
-            concurrent_thread_count -= 1;
-            match response_opt {
-                Some(Response {
-                    payload: ResponsePayload::Nodes(nodes),
-                    receiver,
-                    ..
-                }) => {
-                    queried_nodes.insert(receiver);
-                    for node_data in nodes {
-                        let curr_distance = node_data.id.xor(key);
+                // spawn initial find requests
+                for _ in 0..CONCURRENCY_PARAM {
+                    if let Some(item) = queue.pop() {
+                        self.clone().spawn_find_rpc(
+                            item.0,
+                            *key,
+                            tx.clone(),
+                            find_node,
+                            is_namespace,
+                        );
+                        concurrent_thread_count += 1;
+                    }
+                }
 
-                        if !found_nodes.contains(&node_data) {
-                            if curr_distance < closest_distance {
-                                closest_distance = curr_distance;
-                                is_terminated = false;
+                // loop until we could not find a closer node for a round or if no threads are running
+                while concurrent_thread_count > 0 {
+                    while concurrent_thread_count < CONCURRENCY_PARAM && !queue.is_empty() {
+                        if let Some(item) = queue.pop() {
+                            self.clone().spawn_find_rpc(
+                                item.0,
+                                *key,
+                                tx.clone(),
+                                find_node,
+                                is_namespace,
+                            );
+                            concurrent_thread_count += 1;
+                        }
+                    }
+                    let mut is_terminated = true;
+                    if let Ok(response_opt) = rx.recv() {
+                        concurrent_thread_count -= 1;
+                        match response_opt {
+                            Some(Response {
+                                payload: ResponsePayload::Nodes(nodes),
+                                receiver,
+                                ..
+                            }) => {
+                                queried_nodes.insert(receiver);
+                                for node_data in nodes {
+                                    let curr_distance = node_data.id.xor(key);
+
+                                    if !found_nodes.contains(&node_data) {
+                                        if curr_distance < closest_distance {
+                                            closest_distance = curr_distance;
+                                            is_terminated = false;
+                                        }
+
+                                        found_nodes.insert(node_data.clone());
+                                        let dist = node_data.id.xor(key);
+                                        let next = NodeDataDistancePair(node_data.clone(), dist);
+                                        queue.push(next.clone());
+                                    }
+                                }
                             }
-
-                            found_nodes.insert(node_data.clone());
-                            let dist = node_data.id.xor(key);
-                            let next = NodeDataDistancePair(node_data.clone(), dist);
-                            queue.push(next.clone());
+                            Some(Response {
+                                payload: ResponsePayload::Namespaces(value),
+                                ..
+                            }) => return ResponsePayload::Namespaces(value),
+                            Some(Response {
+                                payload: ResponsePayload::Value(value),
+                                ..
+                            }) => return ResponsePayload::Value(value),
+                            _ => is_terminated = false,
                         }
+
+                        if is_terminated {
+                            break;
+                        }
+                        debug!("CURRENT CLOSEST DISTANCE IS {:?}", closest_distance);
                     }
                 }
-                Some(Response {
-                    payload: ResponsePayload::Namespaces(value),
-                    ..
-                }) => return ResponsePayload::Namespaces(value),
-                Some(Response {
-                    payload: ResponsePayload::Value(value),
-                    ..
-                }) => return ResponsePayload::Value(value),
-                _ => is_terminated = false,
-            }
 
-            if is_terminated {
-                break;
-            }
-            debug!("CURRENT CLOSEST DISTANCE IS {:?}", closest_distance);
-        }
-
-        debug!(
-            "{} TERMINATED LOOKUP BECAUSE NOT CLOSER OR NO THREADS WITH DISTANCE {:?}",
-            self.node_data.addr, closest_distance,
-        );
-
-        // loop until no threads are running or if we found REPLICATION_PARAM active nodes
-        while queried_nodes.len() < REPLICATION_PARAM {
-            while concurrent_thread_count < CONCURRENCY_PARAM && !queue.is_empty() {
-                self.clone().spawn_find_rpc(
-                    queue.pop().unwrap().0,
-                    key.clone(),
-                    tx.clone(),
-                    find_node,
-                    is_namespace,
+                debug!(
+                    "{} TERMINATED LOOKUP BECAUSE NOT CLOSER OR NO THREADS WITH DISTANCE {:?}",
+                    self.node_data.addr, closest_distance,
                 );
-                concurrent_thread_count += 1;
-            }
-            if concurrent_thread_count == 0 {
-                break;
-            }
 
-            let response_opt = rx.recv().unwrap();
-            concurrent_thread_count -= 1;
+                // loop until no threads are running or if we found REPLICATION_PARAM active nodes
+                while queried_nodes.len() < REPLICATION_PARAM {
+                    while concurrent_thread_count < CONCURRENCY_PARAM && !queue.is_empty() {
+                        if let Some(item) = queue.pop() {
+                            self.clone().spawn_find_rpc(
+                                item.0,
+                                *key,
+                                tx.clone(),
+                                find_node,
+                                is_namespace,
+                            );
+                        }
+                        concurrent_thread_count += 1;
+                    }
+                    if concurrent_thread_count == 0 {
+                        break;
+                    }
 
-            match response_opt {
-                Some(Response {
-                    payload: ResponsePayload::Nodes(nodes),
-                    receiver,
-                    ..
-                }) => {
-                    queried_nodes.insert(receiver);
-                    for node_data in nodes {
-                        if !found_nodes.contains(&node_data) {
-                            found_nodes.insert(node_data.clone());
-                            let dist = node_data.id.xor(key);
-                            let next = NodeDataDistancePair(node_data.clone(), dist);
-                            queue.push(next.clone());
+                    if let Some(response_opt) = rx.recv().unwrap_or(None) {
+                        concurrent_thread_count -= 1;
+
+                        match response_opt {
+                            Response {
+                                payload: ResponsePayload::Nodes(nodes),
+                                receiver,
+                                ..
+                            } => {
+                                queried_nodes.insert(receiver);
+                                for node_data in nodes {
+                                    if !found_nodes.contains(&node_data) {
+                                        found_nodes.insert(node_data.clone());
+                                        let dist = node_data.id.xor(key);
+                                        let next = NodeDataDistancePair(node_data.clone(), dist);
+                                        queue.push(next.clone());
+                                    }
+                                }
+                            }
+                            Response {
+                                payload: ResponsePayload::Value(value),
+                                ..
+                            } => return ResponsePayload::Value(value),
+                            _ => {}
                         }
                     }
                 }
-                Some(Response {
-                    payload: ResponsePayload::Value(value),
-                    ..
-                }) => return ResponsePayload::Value(value),
-                _ => {}
-            }
-        }
 
-        let mut ret: Vec<NodeData> = queried_nodes.into_iter().collect();
-        ret.sort_by_key(|node_data| node_data.id.xor(key));
-        ret.truncate(REPLICATION_PARAM);
-        debug!("{} -  CLOSEST NODES ARE {:#?}", self.node_data.addr, ret);
-        ResponsePayload::Nodes(ret)
+                let mut ret: Vec<NodeData> = queried_nodes.into_iter().collect();
+                ret.sort_by_key(|node_data| node_data.id.xor(key));
+                ret.truncate(REPLICATION_PARAM);
+                debug!("{} -  CLOSEST NODES ARE {:#?}", self.node_data.addr, ret);
+                ResponsePayload::Nodes(ret)
+            }
+            Err(e) => e,
+        }
     }
 
     /// > This function is used to register a namespace with the rendezvous server
@@ -1050,48 +1162,53 @@ impl Node {
                     "Failed to obtain lock on storage"
                 )));
             }
-            let pk_share_arr = TryInto::<[u8; 48]>::try_into(public_key_share).unwrap();
-            if let Ok(pk_share) = PublicKeyShare::from_bytes::<[u8; 48]>(pk_share_arr) {
-                let sig_share = TryInto::<[u8; 96]>::try_into(sig_share).unwrap();
-                if let Ok(sig_share) = SignatureShare::from_bytes::<[u8; 96]>(sig_share) {
-                    if pk_share.verify(&sig_share, &payload) {
-                        if let ResponsePayload::Nodes(nodes) = self.lookup_nodes(&key, true, false)
-                        {
-                            for dest in nodes {
-                                let mut node = self.clone();
-                                let key_clone = key.clone();
-                                let quorum_key_clone = quorum_public_key.clone();
-                                let address_clone = address.clone();
-                                let node_type_clone = node_type.clone();
-                                thread::spawn(move || {
-                                    node.rpc_register_peer(
-                                        &dest,
-                                        key_clone,
-                                        quorum_key_clone,
-                                        address_clone,
-                                        raptor_port,
-                                        quic_port,
-                                        node_type_clone,
-                                    );
-                                });
-                            }
-                        }
-                    } else {
-                        return Err(RendezvousError::PeerRegistrationFailed(format!(
-                            "Signature verification failed"
-                        )));
-                    }
-                    return Ok(());
-                } else {
-                    return Err(RendezvousError::PeerRegistrationFailed(format!(
-                        "Sig Share decoding into 48Sized byte array failed "
-                    )));
+            let pk_share_arr: [u8; 48] = public_key_share.try_into().map_err(|_| {
+                RendezvousError::PeerRegistrationFailed(
+                    "PK share decoding into 48-sized byte array failed".to_string(),
+                )
+            })?;
+            let pk_share = PublicKeyShare::from_bytes(&pk_share_arr).map_err(|_| {
+                RendezvousError::PeerRegistrationFailed(
+                    "PK share decoding into PublicKeyShare failed".to_string(),
+                )
+            })?;
+            let sig_share: [u8; 96] = sig_share.try_into().map_err(|_| {
+                RendezvousError::PeerRegistrationFailed(
+                    "Sig Share decoding into 96-sized byte array failed".to_string(),
+                )
+            })?;
+            let sig_share = SignatureShare::from_bytes(&sig_share).map_err(|_| {
+                RendezvousError::PeerRegistrationFailed(
+                    "Sig Share decoding into SignatureShare failed".to_string(),
+                )
+            })?;
+            if !pk_share.verify(&sig_share, &payload) {
+                return Err(RendezvousError::PeerRegistrationFailed(
+                    "Signature verification failed".to_string(),
+                ));
+            }
+            if let ResponsePayload::Nodes(nodes) = self.lookup_nodes(&key, true, false) {
+                for dest in nodes {
+                    let mut node = self.clone();
+                    let key_clone = key.clone();
+                    let quorum_key_clone = quorum_public_key.clone();
+                    let address_clone = address.clone();
+                    let node_type_clone = node_type.clone();
+                    thread::spawn(move || {
+                        node.rpc_register_peer(
+                            &dest,
+                            key_clone,
+                            quorum_key_clone,
+                            address_clone,
+                            raptor_port,
+                            quic_port,
+                            node_type_clone,
+                        );
+                    });
                 }
-            } else {
-                return Err(RendezvousError::PeerRegistrationFailed(format!(
-                    "PK share decoding into 48Sized byte array failed "
-                )));
-            };
+            }
+
+            return Ok(());
         } else {
             Err(RendezvousError::NSRegistrationFailed(format!(
                 "Only Following Namespaces are allowed :{}",
@@ -1121,29 +1238,32 @@ impl Node {
                 let _ = filter.add(&hash);
             }
             let exported_filter = filter.export();
-            let saved = serde_json::to_string(&exported_filter).unwrap();
-            let mut new_values = HashSet::new();
-            if values_received.len() > 0 {
-                let restore_string = String::from_utf8_lossy(&values_received).to_string();
-                if let Ok(restore_json) =
-                    serde_json::from_str::<ExportedCuckooFilter>(&restore_string)
-                {
-                    let recovered_filter = CuckooFilter::<DefaultHasher>::from(restore_json);
-                    for peer_data in value.iter() {
-                        let hash = Node::create_hash(peer_data);
-                        if !recovered_filter.contains(&hash) {
-                            new_values.insert(peer_data.clone());
+            if let Ok(saved) = serde_json::to_string(&exported_filter) {
+                let mut new_values = HashSet::new();
+                if values_received.len() > 0 {
+                    let restore_string = String::from_utf8_lossy(&values_received).to_string();
+                    if let Ok(restore_json) =
+                        serde_json::from_str::<ExportedCuckooFilter>(&restore_string)
+                    {
+                        let recovered_filter = CuckooFilter::<DefaultHasher>::from(restore_json);
+                        for peer_data in value.iter() {
+                            let hash = Node::create_hash(peer_data);
+                            if !recovered_filter.contains(&hash) {
+                                new_values.insert(peer_data.clone());
+                            }
                         }
                     }
+                } else {
+                    let mut rng = rand::thread_rng();
+                    let values: Vec<PeerData> = value.iter().cloned().collect();
+                    let random_peers = values.choose_multiple(&mut rng, NUMBER_PEER_DATA_TO_SEND);
+                    let random_peers: HashSet<_> = random_peers.collect();
+                    new_values = random_peers.iter().map(|&data| data.clone()).collect();
                 }
+                Some((new_values, saved.as_bytes().to_vec()))
             } else {
-                let mut rng = rand::thread_rng();
-                let values: Vec<PeerData> = value.iter().cloned().collect();
-                let random_peers = values.choose_multiple(&mut rng, NUMBER_PEER_DATA_TO_SEND);
-                let random_peers: HashSet<_> = random_peers.collect();
-                new_values = random_peers.iter().map(|&data| data.clone()).collect();
+                None
             }
-            Some((new_values, saved.as_bytes().to_vec()))
         } else {
             None
         }

@@ -4,12 +4,10 @@ version = "0.1.0"
 authors = ["vsawant@vrrb.io"]
 readme = "README.md"
 repository = "https://github.com/vrrb.io/rendezvous-dht"
-documentation = "https://docs.rs/kademlia-dht"
 description = """
 A simple implementation of the Rendezvous DHT.
 """
-categories = ["algorithms", "concurrency", "data-structures"]
-keywords = ["kademlia", "dht","rendezvous"]
+keywords = ["dht","rendezvous"]
 include = ["src/**/*", "Cargo.toml"]
 edition = "2021"
 
@@ -34,6 +32,7 @@ lru_time_cache = "0.11.11"
 crossbeam-channel = "0.5.6"
 cuckoofilter = {version="0.5.0", features = ["serde_support"]}
 serde_json = "1.0.96"
+tracing = "0.1.36"
 
 [dev-dependencies]
 num-bigint = "0.1"

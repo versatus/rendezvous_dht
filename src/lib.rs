@@ -42,4 +42,7 @@ const NAME_SPACES: &'static [&'static str] =
 const UNREACHABLE_THRESDHOLD: u8 = 20;
 
 /// `NUMBER_PEER_DATA_TO_SEND`  the number of peer data to send during request peers operation.
-const NUMBER_PEER_DATA_TO_SEND:usize=3;
+const NUMBER_PEER_DATA_TO_SEND: usize = 3;
+
+/// `RETRY_ATTEMPTS` is a constant that specifies the maximum number of retry attempts for any operation
+const RETRY_ATTEMPTS: i32 = 3;

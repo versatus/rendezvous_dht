@@ -4,6 +4,7 @@ use crate::{BUCKET_REFRESH_INTERVAL, REPLICATION_PARAM, ROUTING_TABLE_SIZE};
 use std::sync::Arc;
 use std::{cmp, mem};
 use time::{Duration, SteadyTime};
+use tracing::info;
 
 /// A k-bucket in a node's routing table that has a maximum capacity of `REPLICATION_PARAM`.
 ///

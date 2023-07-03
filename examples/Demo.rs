@@ -2,6 +2,7 @@ use clap::Parser;
 use rendezvous_dht::{Key, Node, NodeData};
 use sha3::{Digest, Sha3_256};
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::exit;
 use std::thread;
 
@@ -30,7 +31,7 @@ struct Args {
     bootstrap_key: Option<String>,
 
     #[arg(short, long)]
-    port: i16,
+    port: u16,
 
     #[arg(short, long)]
     rendzevous_addr: String,
@@ -52,34 +53,35 @@ fn get_key(key: &[u8]) -> Key {
 }
 
 fn main() {
+    let ip_address = "127.0.0.1";
+
+    // Parse the IP address string into an IpAddr
+    let ip = ip_address.parse::<Ipv4Addr>().unwrap();
+
+    // Create a SocketAddr with the IP address and port
     let args = Args::parse();
+    let socket_addr = SocketAddr::new(IpAddr::V4(ip), args.port as u16);
     let mut node = if args.is_bootstrap {
-        let n = Node::new(
-            "127.0.0.1",
-            args.port.to_string().as_str(),
-            None,
-            args.rendzevous_addr.parse().unwrap(),
-        );
+        let n = Node::new(socket_addr, None, args.rendzevous_addr.parse().unwrap()).unwrap();
         let k = n.node_data().id.0;
-        println!("Key {:?}", hex::encode(k.to_vec()));
-        println!("Node Key is {:?}", n.node_data().id);
         n
     } else {
         let data = hex::decode(&args.bootstrap_key.unwrap()).unwrap();
-        println!("Key is {:?}", data);
         let key: rendezvous_dht::Key = Key::try_from(data).unwrap();
-        let node_data = NodeData::new(
-            String::from("127.0.0.1"),
-            args.port.to_string(),
-            format!("{}:{}", "127.0.0.1", "8080".to_string()),
-            key,
+        let socket_addr = SocketAddr::new(
+            IpAddr::V4(ip_address.parse::<Ipv4Addr>().unwrap()),
+            args.port as u16,
         );
+        let node_data = NodeData::new(socket_addr, key);
         Node::new(
-            "127.0.0.1",
-            args.port.to_string().as_str(),
+            SocketAddr::new(
+                IpAddr::V4(ip_address.parse::<Ipv4Addr>().unwrap()),
+                args.port as u16,
+            ),
             Some(node_data),
             args.rendzevous_addr.parse().unwrap(),
         )
+        .unwrap()
     };
 
     let c = thread::spawn(move || loop {

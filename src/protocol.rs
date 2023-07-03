@@ -5,12 +5,14 @@ use crate::MESSAGE_LENGTH;
 use log::warn;
 use serde_derive::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr};
+use std::net::{SocketAddr, UdpSocket};
 use std::str::FromStr;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::{fmt, str};
+use tracing::error;
 
 /// An enum representing a request RPC.
 ///
@@ -67,6 +69,7 @@ pub enum ResponsePayload {
     NameSpaceUnRegistered,
     NodeUnRegistered,
     Failed(String),
+    Error(String),
 }
 
 /// An enum that represents a message that is sent between nodes.
@@ -93,23 +96,29 @@ impl Protocol {
         thread::spawn(move || {
             let mut buffer = [0u8; MESSAGE_LENGTH];
             loop {
-                let (len, _src_addr) = protocol.socket.recv_from(&mut buffer).unwrap();
-                let message = bincode::deserialize(&buffer[..len]).unwrap();
-
-                if tx.send(message).is_err() {
-                    warn!("Protocol: Connection closed.");
-                    break;
+                if let Ok((len, _src_addr)) = protocol.socket.recv_from(&mut buffer) {
+                    if let Ok(message) = bincode::deserialize(&buffer[..len]) {
+                        if let Err(err) = tx.send(message) {
+                            error!("Protocol: Error sending message: {}", err);
+                            break;
+                        }
+                    }
                 }
             }
         });
         ret
     }
-
     pub fn send_message(&self, message: &Message, node_data: &NodeData) {
-        let buffer_string = bincode::serialize(&message).unwrap();
+        let buffer_string = match bincode::serialize(&message) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                error!("Protocol: Failed to serialize message: {}", err);
+                return;
+            }
+        };
         let NodeData { ref addr, .. } = node_data;
-        if self.socket.send_to(&buffer_string, addr).is_err() {
-            warn!("Protocol: Could not send data.");
+        if let Err(err) = self.socket.send_to(&buffer_string, addr) {
+            warn!("Protocol: Failed to send data: {}", err);
         }
     }
 }
@@ -134,7 +143,8 @@ pub enum RendezvousRequest {
         Payload,
         PeerData,
     ),
-    FetchNameSpace(Vec<u8>)
+    FetchNameSpace(Vec<u8>),
+    CandidateRegistration(Vec<u8>, SocketAddr),
 }
 
 /// A enum that is used to send messages between nodes.
@@ -142,10 +152,10 @@ pub enum RendezvousRequest {
 pub enum RendezvousResponse {
     Pong,
     RequestPeers(Vec<u8>),
-    Peers(Vec<u8>,Vec<PeerData>, ExportedFilter),
+    Peers(Vec<u8>, Vec<PeerData>, ExportedFilter),
     PeerRegistered,
     NamespaceRegistered,
-    Namespaces(Vec<Vec<u8>>)
+    Namespaces(Vec<Vec<u8>>),
 }
 
 /// `PeerData` is a struct that contains a `String` (`address`), two `u16`s (`raptor_udp_port` and
@@ -172,8 +182,11 @@ pub struct PeerData {
 
 impl Default for PeerData {
     fn default() -> Self {
+        let ip: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let port: u16 = 8080;
+        let address = SocketAddr::new(ip, port);
         PeerData {
-            address: "127.0.0.1:8080".parse().unwrap(),
+            address: address.to_string(),
             raptor_udp_port: 0,
             quic_port: 0,
             node_type: NodeType::Validator,
